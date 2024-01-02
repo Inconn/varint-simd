@@ -7,6 +7,7 @@ encoder and decoder written in Rust.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![cfg_attr(rustc_nightly, feature(doc_cfg))]
+#![feature(portable_simd)]
 
 #[cfg(target_arch = "x86")]
 use core::arch::x86::*;
@@ -57,7 +58,7 @@ mod tests {
     #[cfg(target_feature = "avx2")]
     use crate::decode_two_wide_unsafe;
     use crate::{
-        decode, decode_eight_u8_unsafe, decode_four_unsafe, decode_len, decode_two_unsafe, encode,
+        decode, decode_eight_u8_unsafe, decode_four_unsafe, decode_len, decode_two_unsafe, decode_two_std_simd, encode,
         encode_to_slice, VarIntTarget,
     };
 
@@ -216,7 +217,7 @@ mod tests {
                 let first_len = encode_to_slice(*i, &mut enc);
                 let second_len = encode_to_slice(*j, &mut enc[first_len as usize..]);
 
-                let decoded = unsafe { decode_two_unsafe::<T, U>(enc.as_ptr()) };
+                let decoded = decode_two_std_simd::<T, U>(enc);
                 assert_eq!(decoded.0, *i);
                 assert_eq!(decoded.1, *j);
                 assert_eq!(decoded.2, first_len);

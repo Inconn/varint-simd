@@ -2,6 +2,7 @@
 use core::arch::x86::*;
 #[cfg(target_arch = "x86_64")]
 use core::arch::x86_64::*;
+use core::simd::prelude::*;
 use core::cmp::min;
 
 use crate::num::{SignedVarIntTarget, VarIntTarget};
@@ -197,6 +198,78 @@ pub unsafe fn decode_unsafe<T: VarIntTarget>(bytes: *const u8) -> (T, usize) {
     }
 }
 
+#[inline]
+#[cfg(any(target_feature = "ssse3", doc))]
+#[cfg_attr(rustc_nightly, doc(cfg(target_feature = "ssse3")))]
+pub fn decode_two_std_simd<T: VarIntTarget, U: VarIntTarget>(
+    bytes: [u8; 16],
+) -> (T, U, u8, u8) {
+    if T::MAX_VARINT_BYTES + U::MAX_VARINT_BYTES > 16 {
+        // check will be eliminated at compile time
+        panic!(
+            "exceeded length limit: cannot decode {} and {}, total length {} exceeds 16 bytes",
+            core::any::type_name::<T>(),
+            core::any::type_name::<U>(),
+            T::MAX_VARINT_BYTES + U::MAX_VARINT_BYTES
+        );
+    }
+
+    if T::MAX_VARINT_BYTES <= 5 && U::MAX_VARINT_BYTES <= 5 {
+        // This will work with our lookup table, use that version
+        return unsafe { decode_two_u32_unsafe(bytes.as_ptr()) };
+    }
+
+    let b = Simd::from_array(bytes);
+
+    let bitmask = b.simd_lt(Simd::splat(0b10000000));
+    let bitmask_u64 = bitmask.to_bitmask();
+
+    let first_len = bitmask_u64.trailing_zeros() + 1;
+    let bitmask_u64_2 = bitmask_u64.checked_shr(first_len.into()).unwrap_or(0);
+    let second_len = bitmask_u64_2.trailing_zeros() + 1;
+
+    let ascend = u8x16::from_array([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
+
+    let first_len_vec = Simd::splat(first_len as u8);
+    let first_mask = ascend.simd_lt(first_len_vec.cast());
+    let first = first_mask.select(b, Simd::splat(0));
+
+    let second_shuf = ascend + first_len_vec.cast();
+    let second_shuffled = b.swizzle_dyn(second_shuf);
+    let second_mask = ascend.simd_lt(Simd::splat(second_len as u8).cast());
+    let second = second_mask.select(second_shuffled, Simd::splat(0));
+
+    let first_num;
+    let second_num;
+
+    // Only use "turbo" mode if the numbers fit in 64-bit lanes
+    let should_turbo = T::MAX_VARINT_BYTES <= 8
+        && U::MAX_VARINT_BYTES <= 8
+        && cfg!(not(all(target_feature = "bmi2", very_fast_pdep)));
+    if should_turbo {
+        // const, so optimized out
+        let comb = first | simd_swizzle!(first, [8, 9, 10, 12, 13, 14, 15, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+
+        let x = if T::MAX_VARINT_BYTES <= 2 && U::MAX_VARINT_BYTES <= 2 {
+            unsafe { dual_u8_stage2_std_simd(comb) }
+        } else if T::MAX_VARINT_BYTES <= 3 && U::MAX_VARINT_BYTES <= 3 {
+            unsafe { dual_u16_stage2_std_simd(comb) }
+        } else {
+            unsafe { dual_u32_stage2_std_simd(comb) }
+        };
+
+        let x: [u32; 4] = unsafe{ core::mem::transmute(x) };
+        // _mm_extract_epi32 requires SSE4.1
+        first_num = T::cast_u32(x[0]);
+        second_num = U::cast_u32(x[2]);
+    } else {
+        first_num = T::vector_to_num(*first.as_array());
+        second_num = U::vector_to_num(*second.as_array());
+    }
+
+    (first_num, second_num, first_len as u8, second_len as u8)
+}
+
 /// Decodes two adjacent varints simultaneously. Target types must fit within 16 bytes when varint
 /// encoded. Requires SSSE3 support.
 ///
@@ -343,6 +416,12 @@ unsafe fn dual_u8_stage2(comb: __m128i) -> __m128i {
 }
 
 #[inline(always)]
+unsafe fn dual_u8_stage2_std_simd(comb: u8x16) -> u8x16 {
+    (comb & core::mem::transmute::<u64x2, u8x16>(u64x2::splat(0x000000000000007f)))
+     | ((comb & core::mem::transmute::<u64x2, u8x16>(u64x2::splat(0x0000000000000100))) << 1)
+}
+
+#[inline(always)]
 unsafe fn dual_u16_stage2(comb: __m128i) -> __m128i {
     _mm_or_si128(
         _mm_or_si128(
@@ -357,6 +436,13 @@ unsafe fn dual_u16_stage2(comb: __m128i) -> __m128i {
             1,
         ),
     )
+}
+
+#[inline(always)]
+unsafe fn dual_u16_stage2_std_simd(comb: u8x16) -> u8x16 {
+    (comb & core::mem::transmute::<u64x2, u8x16>(u64x2::splat(0x000000000000007f)))
+     | ((comb & core::mem::transmute::<u64x2, u8x16>(u64x2::splat(0x0000000000030000))) << 2)
+     | ((comb & core::mem::transmute::<u64x2, u8x16>(u64x2::splat(0x0000000000007f00))) << 1)
 }
 
 #[inline(always)]
@@ -386,6 +472,15 @@ unsafe fn dual_u32_stage2(comb: __m128i) -> __m128i {
             ),
         ),
     )
+}
+
+#[inline(always)]
+unsafe fn dual_u32_stage2_std_simd(comb: u8x16) -> u8x16 {
+    (comb & core::mem::transmute::<u64x2, u8x16>(u64x2::splat(0x000000000000007f)))
+        | ((comb & core::mem::transmute::<u64x2, u8x16>(u64x2::splat(0x0000000f00000000))) << 4)
+        | ((comb & core::mem::transmute::<u64x2, u8x16>(u64x2::splat(0x000000007f000000))) << 3)
+        | ((comb & core::mem::transmute::<u64x2, u8x16>(u64x2::splat(0x00000000007f0000))) << 2)
+        | ((comb & core::mem::transmute::<u64x2, u8x16>(u64x2::splat(0x0000000000007f00))) << 1)
 }
 
 /// **Experimental. May have relatively poor performance.** Decode two adjacent varints
